@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Automatisation des factures Deztination
-========================================
-1. Cree le folder de la semaine (dimanche)
-2. Copie le template Excel dedans
-3. Lit tous les PDFs du folder _zappier
-4. Remplit le Excel automatiquement
+Invoice Automation Script
+==========================
+Reads PDF invoices from a watch folder, extracts key data,
+fills a weekly Excel report automatically, and renames files.
 
-Usage: python3 factures_auto.py
+SETUP — edit the CONFIG section below before running.
+
+Usage: python3 invoice_automation.py
 """
 
 import os
@@ -16,10 +16,66 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 
-ONEDRIVE = Path.home() / "OneDrive"
-BASE_FOLDER = ONEDRIVE / "2_Client_Corpo" / "ITI" / "Factures"
-ZAPIER_FOLDER = BASE_FOLDER / "_zappier"
-TEMPLATE_FILE = BASE_FOLDER / "Visa_report_2026Blank.xlsx"
+# ============================================================
+#  CONFIG — edit these values for your setup
+# ============================================================
+
+# Root folder where your weekly reports live (OneDrive, Dropbox, local, etc.)
+BASE_FOLDER = Path.home() / "Documents" / "Invoices"
+
+# Subfolder where new PDFs land (your watch/inbox folder)
+INBOX_FOLDER = BASE_FOLDER / "_inbox"
+
+# Your blank Excel template
+TEMPLATE_FILE = BASE_FOLDER / "Invoice_Report_Blank.xlsx"
+
+# Company/project name shown in console output
+COMPANY_NAME = "My Company"
+
+# Vendors to auto-detect from invoice descriptions.
+# Format: { "KEYWORD_IN_PDF": "Label in Excel" }
+# Add or remove vendors as needed.
+VENDOR_KEYWORDS = {
+    "AIRLINE A":  "Airline A",
+    "AIRLINE B":  "Airline B",
+    "RAIL":       "Rail",
+    "CAR RENTAL": "Car Rental",
+}
+
+# Fallback vendor label when no keyword matches
+DEFAULT_VENDOR = COMPANY_NAME
+
+# Fallback description when no keyword matches
+DEFAULT_DESCRIPTION = "Service Fee"
+
+# PDF language keywords (adjust if your invoices are in another language)
+KEYWORDS = {
+    "passengers":   "Passengers:",       # label before passenger names
+    "reference":    "REFERENCE",         # section header for line items
+    "payments":     "PAYMENTS",          # section header for payment lines
+    "total":        "Total payments",    # end-of-payments marker
+    "project":      "Project:",          # project/cost-centre field
+    "advisor":      "Advisor:",          # label before invoice date
+    "dossier":      "Dossier:",          # file/dossier number
+    "skip_desc":    "INDEMNITY FUND",    # description lines to ignore
+}
+
+# Excel row range for data (first data row, last data row)
+EXCEL_FIRST_ROW = 12
+EXCEL_LAST_ROW  = 41
+
+# Excel column positions (1-indexed)
+COL_DATE        = 2
+COL_VENDOR      = 3
+COL_DESCRIPTION = 5
+COL_DOSSIER     = 8
+COL_INVOICE_NUM = 9
+COL_CURRENCY    = 10
+COL_AMOUNT      = 12
+
+# ============================================================
+#  END CONFIG
+# ============================================================
 
 def check_and_install():
     try:
@@ -28,19 +84,22 @@ def check_and_install():
     except ImportError:
         print("Installing required modules...")
         os.system("pip3 install pypdf openpyxl --quiet")
+
 check_and_install()
 
 from pypdf import PdfReader
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
 
-BLUE_FILL = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
-BLUE_FONT = Font(color="0070C0", bold=True)
+HIGHLIGHT_FILL = PatternFill(start_color="BDD7EE", end_color="BDD7EE", fill_type="solid")
+HIGHLIGHT_FONT = Font(color="0070C0", bold=True)
+
 
 def get_sunday_of_week():
     today = datetime.today()
     sunday = today + timedelta(days=(6 - today.weekday()))
     return sunday.strftime("%Y%m%d")
+
 
 def get_or_create_weekly_folder():
     week_name = get_sunday_of_week()
@@ -52,9 +111,10 @@ def get_or_create_weekly_folder():
         print(f"📁 Folder exists: {week_name}")
     return week_folder
 
+
 def get_or_create_weekly_excel(week_folder):
     week_name = week_folder.name
-    excel_name = f"Visa_report_{week_name}.xlsx"
+    excel_name = f"Invoice_Report_{week_name}.xlsx"
     excel_path = week_folder / excel_name
     if not excel_path.exists():
         if not TEMPLATE_FILE.exists():
@@ -66,26 +126,27 @@ def get_or_create_weekly_excel(week_folder):
         print(f"📄 Excel exists: {excel_name}")
     return excel_path
 
-def detect_airline(conf_number):
+
+def detect_vendor(description):
     """
-    Returns (airline_code, needs_review)
-    AC:      confirmation starts with 014 and is 10 digits
-    Porter:  confirmation is 6 alphanumeric chars
-    Unknown: needs review
+    Returns (vendor_label, needs_review).
+    Matches against VENDOR_KEYWORDS defined in CONFIG.
     """
-    if not conf_number:
+    if not description:
         return "VERIFY", True
-    conf = conf_number.strip()
-    if re.match(r'^014\d+$', conf):
-        return "AC", False
-    if re.match(r'^[A-Z0-9]{6}$', conf):
-        return "Porter", False
+    desc_upper = description.upper()
+    for keyword, label in VENDOR_KEYWORDS.items():
+        if keyword.upper() in desc_upper:
+            return label, False
     return "VERIFY", True
+
 
 def extract_pdf_data(pdf_path):
     """
-    Returns a LIST of charge dicts, one per payment line.
-    Each dict: date, dossier, payer, payer_needs_review, description, facture, currency, total, passengers, project
+    Returns a list of charge dicts extracted from the PDF.
+    Each dict: date, dossier, vendor, vendor_needs_review,
+               description, invoice_num, currency, total,
+               passengers, project
     """
     try:
         reader = PdfReader(str(pdf_path))
@@ -95,64 +156,63 @@ def extract_pdf_data(pdf_path):
 
         lines = text.split('\n')
 
-        # --- Shared fields ---
-        dossier = None
-        date = None
-        currency = None
+        dossier    = None
+        date       = None
+        currency   = None
         passengers = []
-        project = None
+        project    = None
         seen_names = set()
 
-        # Dossier
-        m = re.search(r'Dossier:\s*(\d+)', text)
+        # Dossier number
+        m = re.search(rf'{re.escape(KEYWORDS["dossier"])}\s*(\d+)', text)
         if m:
             dossier = m.group(1)
 
-        # Date
+        # Invoice date (line after "Advisor:" label)
         for i, line in enumerate(lines):
-            if 'Conseiller:' in line:
-                for j in range(i+1, min(i+5, len(lines))):
+            if KEYWORDS["advisor"] in line:
+                for j in range(i + 1, min(i + 5, len(lines))):
                     m2 = re.match(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\s*$', lines[j])
                     if m2:
                         try:
                             dt = datetime.strptime(m2.group(1), "%m/%d/%Y")
                             date = dt.strftime("%d-%m-%Y")
-                        except:
+                        except Exception:
                             date = m2.group(1)
                         break
                 break
 
-        # Project
+        # Project / cost centre
         for line in lines:
-            m = re.search(r'Projet/Project:\s*(\S+)', line, re.IGNORECASE)
+            m = re.search(rf'{re.escape(KEYWORDS["project"])}\s*(\S+)', line, re.IGNORECASE)
             if m:
                 val = m.group(1).strip()
                 if val:
                     project = val
                 break
 
-        # Passengers
+        # Passenger names
         def clean_name(raw):
             raw = re.sub(r'\b(Mrs?|Ms|Mme|M)\.\s*', '', raw, flags=re.IGNORECASE).strip()
-            raw = re.split(r'\s+(?:REFUSE|CDN|PASSPORT|ASSURANCE|CANCELLATION)', raw, flags=re.IGNORECASE)[0].strip()
+            raw = re.split(r'\s+(?:REFUSED?|CDN|PASSPORT)', raw, flags=re.IGNORECASE)[0].strip()
             raw = raw.strip(' -')
             if raw and re.match(r'[A-Za-zÀ-ÿ\-\ ]+$', raw):
                 return re.sub(r'\s+', '', raw.title())
             return None
 
         for i, line in enumerate(lines):
-            if 'Passagers:' in line:
-                m = re.match(r'(.+?)Passagers:', line)
+            if KEYWORDS["passengers"] in line:
+                m = re.match(rf'(.+?){re.escape(KEYWORDS["passengers"])}', line)
                 if m:
                     name = clean_name(m.group(1))
                     if name and name not in seen_names:
                         passengers.append(name)
                         seen_names.add(name)
-                for j in range(i+1, min(i+5, len(lines))):
+                for j in range(i + 1, min(i + 5, len(lines))):
                     next_line = lines[j].strip()
-                    if re.match(r'(RÉFÉRENCE|TOTAL|PAIEMENTS|SERVICE FEES|Vols|FOND)', next_line, re.IGNORECASE):
+                    if re.match(r'(REFERENCE|TOTAL|PAYMENTS|SERVICE FEES)', next_line, re.IGNORECASE):
                         break
-                    if re.search(r'REFUSE', next_line, re.IGNORECASE):
+                    if next_line:
                         name = clean_name(next_line)
                         if name and name not in seen_names:
                             passengers.append(name)
@@ -165,37 +225,37 @@ def extract_pdf_data(pdf_path):
         elif re.search(r'\bEUR\b', text):
             currency = "EUR"
 
-        # --- Extract payment lines ---
+        # Payment lines
         payments = []
         in_payments = False
         for line in lines:
-            if 'PAIEMENTS' in line:
+            if KEYWORDS["payments"] in line:
                 in_payments = True
                 continue
             if in_payments:
-                if 'Total des paiements' in line:
+                if KEYWORDS["total"] in line:
                     break
                 m = re.match(r'(\d{8})\s+CAD.*?\s+([-\d,]+\.\d{2})\s*$', line)
                 if m:
                     payments.append({
-                        'facture': str(int(m.group(1))),
-                        'amount': float(m.group(2).replace(',', ''))
+                        'invoice_num': str(int(m.group(1))),
+                        'amount':      float(m.group(2).replace(',', ''))
                     })
 
-        # --- Extract descriptions (skip FOND D'INDEMNISATION) ---
+        # Description lines (skip the ignore keyword from CONFIG)
         descriptions = []
-        in_ref = False
+        in_ref       = False
         current_desc = []
 
         for line in lines:
-            if 'RÉFÉRENCE' in line or 'REFERENCE' in line:
+            if KEYWORDS["reference"] in line:
                 in_ref = True
                 continue
             if in_ref:
-                if 'PAIEMENTS' in line or re.match(r'\s*Total:', line):
+                if KEYWORDS["payments"] in line or re.match(r'\s*Total:', line):
                     if current_desc:
                         desc = ' '.join(current_desc).strip()
-                        if not re.search(r'FOND D.INDEMNISATION', desc, re.IGNORECASE):
+                        if not re.search(re.escape(KEYWORDS["skip_desc"]), desc, re.IGNORECASE):
                             desc = re.sub(r'\s+[\d,]+\.\d{2}\s+CAD.*$', '', desc).strip()
                             desc = re.sub(r'\s{2,}', ' ', desc).strip()[:60]
                             descriptions.append(desc)
@@ -203,7 +263,7 @@ def extract_pdf_data(pdf_path):
                 if re.match(r'^\s*[-\d]', line):
                     if current_desc:
                         desc = ' '.join(current_desc).strip()
-                        if not re.search(r'FOND D.INDEMNISATION', desc, re.IGNORECASE):
+                        if not re.search(re.escape(KEYWORDS["skip_desc"]), desc, re.IGNORECASE):
                             desc = re.sub(r'\s+[\d,]+\.\d{2}\s+CAD.*$', '', desc).strip()
                             desc = re.sub(r'\s{2,}', ' ', desc).strip()[:60]
                             descriptions.append(desc)
@@ -212,87 +272,40 @@ def extract_pdf_data(pdf_path):
                 if line.strip():
                     current_desc.append(line.strip())
 
-        # --- Build charge list, one per payment ---
-        # Match descriptions to payments by amount when possible
-        # First try direct order match, fallback to amount matching
+        # Build one charge per payment line
         charges = []
         used_desc_indices = set()
 
-        def find_desc_for_amount(amount, descriptions, used):
-            """Find best matching description for a payment amount"""
-            # For negative amounts, look for REFUND descriptions
-            if amount < 0:
-                for i, d in enumerate(descriptions):
-                    if i not in used and re.search(r'REFUND|REMBOURS', d, re.IGNORECASE):
-                        return i, d
-            # For HERTZ amounts, look for HERTZ descriptions
-            for i, d in enumerate(descriptions):
-                if i not in used and re.search(r'HERTZ', d, re.IGNORECASE):
-                    # Check if amount roughly matches
-                    return i, d
-            # Default: next unused description
-            for i, d in enumerate(descriptions):
-                if i not in used:
-                    return i, d
-            return None, ""
-
         for idx, payment in enumerate(payments):
             if idx < len(descriptions):
-                # Try smart matching for special cases
-                if payment['amount'] < 0 or (idx < len(descriptions) and
-                    re.search(r'REFUND|HERTZ', descriptions[idx] if idx < len(descriptions) else '', re.IGNORECASE)):
-                    di, desc = find_desc_for_amount(payment['amount'], descriptions, used_desc_indices)
-                    if di is not None:
-                        used_desc_indices.add(di)
-                    else:
-                        desc = ""
-                else:
-                    # Use next available description in order
-                    di = idx
-                    while di in used_desc_indices and di < len(descriptions):
-                        di += 1
-                    if di < len(descriptions):
-                        desc = descriptions[di]
-                        used_desc_indices.add(di)
-                    else:
-                        desc = ""
+                di = idx
+                while di in used_desc_indices and di < len(descriptions):
+                    di += 1
+                desc = descriptions[di] if di < len(descriptions) else ""
+                if di < len(descriptions):
+                    used_desc_indices.add(di)
             else:
                 desc = ""
 
-            # Determine payer from description
-            is_flight = re.search(r'RESERVATION VOL', desc, re.IGNORECASE) and re.search(r'Vols.*Conf', desc, re.IGNORECASE)
-            is_train = re.search(r'VIA RAIL|RESERVATION TRAIN', desc, re.IGNORECASE)
+            vendor, needs_review = detect_vendor(desc)
 
-            is_hertz = re.search(r'HERTZ', desc, re.IGNORECASE)
-
-            if is_flight or re.search(r'Vols.*Conf', desc, re.IGNORECASE):
-                conf_match = re.search(r'Vols[^#]*#\s*([A-Z0-9]+)', desc, re.IGNORECASE)
-                conf = conf_match.group(1).strip() if conf_match else None
-                if conf and re.match(r'^014\d+$', conf):
-                    payer, needs_review = "AC", False
-                elif conf and re.match(r'^[A-Z0-9]{6}$', conf):
-                    payer, needs_review = "Porter", False
-                else:
-                    payer, needs_review = "VERIFY", True
-            elif is_train:
-                payer, needs_review = "Via", False
-            elif is_hertz:
-                payer, needs_review = "Hertz", False
-            else:
-                payer, needs_review = "Deztination", False
-                desc = "Frais de service/FICAV"
+            # If no vendor matched, use default label and description
+            if needs_review and not desc:
+                vendor       = DEFAULT_VENDOR
+                desc         = DEFAULT_DESCRIPTION
+                needs_review = False
 
             charges.append({
-                "date": date,
-                "dossier": dossier,
-                "payer": payer,
-                "payer_needs_review": needs_review,
-                "description": desc,
-                "facture": payment["facture"],
-                "currency": currency,
-                "total": payment["amount"],
-                "passengers": passengers,
-                "project": project,
+                "date":               date,
+                "dossier":            dossier,
+                "vendor":             vendor,
+                "vendor_needs_review": needs_review,
+                "description":        desc,
+                "invoice_num":        payment["invoice_num"],
+                "currency":           currency,
+                "total":              payment["amount"],
+                "passengers":         passengers,
+                "project":            project,
             })
 
         return charges if charges else None
@@ -301,56 +314,61 @@ def extract_pdf_data(pdf_path):
         print(f"   ⚠️  Error reading PDF: {e}")
         return None
 
+
 def get_already_processed(ws):
     processed = set()
-    for row in ws.iter_rows(min_row=12, max_row=41, values_only=True):
-        if row[8] and row[11]:  # facture + total
-            processed.add(f"{row[8]}_{row[11]}")
+    for row in ws.iter_rows(
+        min_row=EXCEL_FIRST_ROW, max_row=EXCEL_LAST_ROW, values_only=True
+    ):
+        inv = row[COL_INVOICE_NUM - 1]
+        amt = row[COL_AMOUNT - 1]
+        if inv and amt:
+            processed.add(f"{inv}_{amt}")
     return processed
+
 
 def fill_excel(excel_path, all_data):
     wb = load_workbook(str(excel_path))
     ws = wb.active
     already_done = get_already_processed(ws)
 
-    added = 0
+    added   = 0
     skipped = 0
 
-    # all_data is a list of lists (each PDF returns a list of charges)
     for charge_list in all_data:
         if not charge_list:
             continue
         for charge in charge_list:
-            key = f"{charge['facture']}_{charge['total']}"
+            key = f"{charge['invoice_num']}_{charge['total']}"
             if key in already_done:
                 skipped += 1
                 continue
 
-            # Find next empty row (12-41)
             target_row = None
-            for row_num in range(12, 42):
-                if ws.cell(row=row_num, column=2).value is None and ws.cell(row=row_num, column=3).value is None:
+            for row_num in range(EXCEL_FIRST_ROW, EXCEL_LAST_ROW + 1):
+                if (ws.cell(row=row_num, column=COL_DATE).value is None and
+                        ws.cell(row=row_num, column=COL_VENDOR).value is None):
                     target_row = row_num
                     break
 
             if target_row is None:
-                print("   ⚠️  Excel full — no more rows available (max 30)")
+                print(f"   ⚠️  Excel full — max {EXCEL_LAST_ROW - EXCEL_FIRST_ROW + 1} rows")
                 break
 
-            ws.cell(row=target_row, column=2).value = charge["date"]
-            ws.cell(row=target_row, column=5).value = charge["description"]
-            ws.cell(row=target_row, column=8).value = charge["dossier"]
-            ws.cell(row=target_row, column=9).value = charge["facture"]
-            ws.cell(row=target_row, column=10).value = charge["currency"]
-            ws.cell(row=target_row, column=12).value = charge["total"]
+            ws.cell(row=target_row, column=COL_DATE).value        = charge["date"]
+            ws.cell(row=target_row, column=COL_DESCRIPTION).value = charge["description"]
+            ws.cell(row=target_row, column=COL_DOSSIER).value     = charge["dossier"]
+            ws.cell(row=target_row, column=COL_INVOICE_NUM).value = charge["invoice_num"]
+            ws.cell(row=target_row, column=COL_CURRENCY).value    = charge["currency"]
+            ws.cell(row=target_row, column=COL_AMOUNT).value      = charge["total"]
 
-            payer_cell = ws.cell(row=target_row, column=3)
-            if charge["payer_needs_review"]:
-                payer_cell.value = "VERIFY"
-                payer_cell.fill = BLUE_FILL
-                payer_cell.font = BLUE_FONT
+            vendor_cell = ws.cell(row=target_row, column=COL_VENDOR)
+            if charge["vendor_needs_review"]:
+                vendor_cell.value = "VERIFY"
+                vendor_cell.fill  = HIGHLIGHT_FILL
+                vendor_cell.font  = HIGHLIGHT_FONT
             else:
-                payer_cell.value = charge["payer"]
+                vendor_cell.value = charge["vendor"]
 
             already_done.add(key)
             added += 1
@@ -359,18 +377,17 @@ def fill_excel(excel_path, all_data):
     return added, skipped
 
 
-def rename_pdf(pdf_path, data):
-    """Renames PDF to include facture number, passengers and project"""
-    dossier = data.get("dossier", "")
-    facture = data.get("facture", "")
-    passengers = data.get("passengers", [])
-    project = data.get("project", "")
+def rename_pdf(pdf_path, charge):
+    dossier     = charge.get("dossier", "")
+    invoice_num = charge.get("invoice_num", "")
+    passengers  = charge.get("passengers", [])
+    project     = charge.get("project", "")
 
-    if not facture:
+    if not invoice_num:
         return
 
-    parts = [f"FactureCL_Deztination-{dossier}", facture]
-    parts += passengers
+    parts    = [f"Invoice_{dossier}", invoice_num]
+    parts   += passengers
     if project:
         parts.append(project)
 
@@ -386,28 +403,31 @@ def rename_pdf(pdf_path, data):
     else:
         print(f"   📝 Name already correct")
 
+
 def main():
     print("=" * 50)
-    print("  INVOICE AUTOMATION — DEZTINATION")
+    print(f"  INVOICE AUTOMATION — {COMPANY_NAME.upper()}")
     print("=" * 50)
     print()
 
     if not BASE_FOLDER.exists():
         print(f"❌ Base folder not found: {BASE_FOLDER}")
+        print("   Update BASE_FOLDER in the CONFIG section.")
         return
 
-    if not ZAPIER_FOLDER.exists():
-        print(f"❌ Zappier folder not found: {ZAPIER_FOLDER}")
+    if not INBOX_FOLDER.exists():
+        print(f"❌ Inbox folder not found: {INBOX_FOLDER}")
+        print("   Update INBOX_FOLDER in the CONFIG section.")
         return
 
     week_folder = get_or_create_weekly_folder()
-    excel_path = get_or_create_weekly_excel(week_folder)
+    excel_path  = get_or_create_weekly_excel(week_folder)
 
-    pdfs = list(ZAPIER_FOLDER.glob("*.pdf"))
+    pdfs = list(INBOX_FOLDER.glob("*.pdf"))
 
     if not pdfs:
-        print(f"\n📭 No PDFs found in: {ZAPIER_FOLDER}")
-        print("   Add PDFs to the _zappier folder and run again.")
+        print(f"\n📭 No PDFs found in: {INBOX_FOLDER}")
+        print("   Add PDFs to the inbox folder and run again.")
         return
 
     print(f"\n🔍 {len(pdfs)} PDF(s) found\n")
@@ -418,8 +438,9 @@ def main():
         charges = extract_pdf_data(pdf)
         if charges:
             for charge in charges:
-                status = "⚠️  VERIFY payer" if charge["payer_needs_review"] else "✅"
-                print(f"   {status} Invoice {charge['facture']} — {charge['payer']} — {charge['total']} {'CAD' if not charge['currency'] else charge['currency']}")
+                status = "⚠️  VERIFY vendor" if charge["vendor_needs_review"] else "✅"
+                currency_label = charge["currency"] or "CAD"
+                print(f"   {status} Invoice {charge['invoice_num']} — {charge['vendor']} — {charge['total']} {currency_label}")
             all_data.append(charges)
             rename_pdf(pdf, charges[0])
         else:
@@ -435,9 +456,10 @@ def main():
     if skipped > 0:
         print(f"  {skipped} invoice(s) already present — skipped")
     print(f"  File: {excel_path.name}")
-    if any(c["payer_needs_review"] for charges in all_data for c in charges):
-        print(f"  ⚠️  Some payers marked VERIFY in blue — please fill in manually")
+    if any(c["vendor_needs_review"] for charges in all_data for c in charges):
+        print(f"  ⚠️  Some vendors marked VERIFY in blue — fill in manually")
     print("=" * 50)
+
 
 if __name__ == "__main__":
     main()
