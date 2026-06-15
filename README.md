@@ -38,3 +38,19 @@ paths, the Excel template, and vendor keywords.
 Clone the repo, edit the CONFIG section in `factures_auto.py` 
 (base folder, inbox folder, Excel template path, vendor 
 keywords), then run:
+
+Missing dependencies install automatically the first time.
+
+## Why I Built This
+
+5-6 hours a week of opening PDFs one by one and typing the 
+same fields into Excel adds up to entire workdays over a 
+year - time that could go toward actual client work instead 
+of data entry.
+
+I built this to run that whole process in under a minute, 
+and to only flag what it's genuinely unsure about instead of 
+guessing on vendor names. The CONFIG block at the top means 
+it's not tied to one company's invoice format - I could hand 
+this to someone else and they'd just need to update a few 
+values to point it at their own folders and vendors.
